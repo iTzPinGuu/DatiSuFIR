@@ -1,4 +1,3 @@
-
 import io
 import json
 import os
@@ -14,6 +13,7 @@ from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen import canvas as rl_canvas
 
 DB_FILE = 'fir_anagrafiche_db.json'
+SENZA_TARGA = '<SENZA TARGA>'
 
 FIELDS_BASE = {
     'RegistroNO': {'type': 'x', 'x': 239.67, 'y': 792.57},
@@ -44,15 +44,23 @@ COORDS_DYNAMIC = {
 DEFAULT_DB = {'anagrafiche': []}
 
 
+def sort_anagrafiche(data):
+    if 'anagrafiche' in data and isinstance(data['anagrafiche'], list):
+        data['anagrafiche'].sort(key=lambda x: x.get('denominazione', '').lower())
+
+
 def load_db():
     if not os.path.exists(DB_FILE):
         save_db(DEFAULT_DB)
         return {'anagrafiche': []}
     with open(DB_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+        data = json.load(f)
+        sort_anagrafiche(data)
+        return data
 
 
 def save_db(data):
+    sort_anagrafiche(data)
     with open(DB_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -78,11 +86,122 @@ def build_fields(record, selected_targa):
     fields['TrasportatoreDenominazione'] = {**COORDS_DYNAMIC['TrasportatoreDenominazione'], 'value': record.get('denominazione', '')}
     fields['TrasportatoreCodiceFiscale'] = {**COORDS_DYNAMIC['TrasportatoreCodiceFiscale'], 'value': record.get('codice_fiscale', '')}
     fields['TrasportatoreAlbo'] = {**COORDS_DYNAMIC['TrasportatoreAlbo'], 'value': record.get('numero_iscrizione', '')}
-    fields['TrasportatoreAutomezzo'] = {**COORDS_DYNAMIC['TrasportatoreAutomezzo'], 'value': selected_targa or ''}
+    
+    targa_val = '' if selected_targa == SENZA_TARGA else (selected_targa or '')
+    fields['TrasportatoreAutomezzo'] = {**COORDS_DYNAMIC['TrasportatoreAutomezzo'], 'value': targa_val}
     fields['Conducente'] = {**COORDS_DYNAMIC['Conducente'], 'value': record.get('conducente', '')}
     if tipo == '4BIS':
         fields['Annotazioni'] = {**COORDS_DYNAMIC['Annotazioni'], 'value': 'RIFIUTO DI PROPRIETÀ DEL TRASPORTATORE'}
     return fields
+
+
+class MixedModeDialog(tk.Toplevel):
+    def __init__(self, parent, available_targhe, total_pdf_pages, current_allocations, on_save):
+        super().__init__(parent)
+        self.title("Configurazione Modalità Mista Targhe")
+        self.geometry("540x460")
+        self.resizable(False, False)
+        self.grab_set()
+
+        self.available_targhe = available_targhe
+        self.total_pdf_pages = total_pdf_pages
+        self.total_firs = total_pdf_pages // 4 if total_pdf_pages > 0 else 0
+        self.allocations = [dict(a) for a in current_allocations]
+        self.on_save = on_save
+
+        self._build_ui()
+
+    def _build_ui(self):
+        main = ttk.Frame(self, padding=14)
+        main.pack(fill='both', expand=True)
+
+        info_text = f"Formulari totali stimati nel PDF: {self.total_firs} ({self.total_pdf_pages} pagine)" if self.total_pdf_pages > 0 else "Nessun PDF caricato (definisci i blocchi liberamente)."
+        ttk.Label(main, text=info_text, font=('Segoe UI Semibold', 10)).pack(anchor='w', pady=(0, 10))
+
+        # Form di inserimento
+        form_frame = ttk.LabelFrame(main, text="Aggiungi Blocco Formulario", padding=10)
+        form_frame.pack(fill='x', pady=(0, 10))
+
+        ttk.Label(form_frame, text="Targa:").grid(row=0, column=0, sticky='w')
+        self.cbo_targa_dlg = ttk.Combobox(form_frame, values=self.available_targhe, width=16, state='readonly')
+        self.cbo_targa_dlg.grid(row=0, column=1, padx=(6, 12))
+        if self.available_targhe:
+            self.cbo_targa_dlg.set(self.available_targhe[0])
+
+        ttk.Label(form_frame, text="N° Formulari:").grid(row=0, column=2, sticky='w')
+        self.ent_qty = ttk.Entry(form_frame, width=8)
+        self.ent_qty.insert(0, "50")
+        self.ent_qty.grid(row=0, column=3, padx=(6, 12))
+
+        ttk.Button(form_frame, text="Aggiungi", command=self.add_allocation).grid(row=0, column=4)
+
+        # Tabella Allocazioni
+        self.tree = ttk.Treeview(main, columns=('targa', 'firs', 'pages'), show='headings', height=8)
+        self.tree.heading('targa', text='Targa')
+        self.tree.heading('firs', text='N° Formulari')
+        self.tree.heading('pages', text='Pagine Coperta')
+        self.tree.column('targa', width=160)
+        self.tree.column('firs', width=120, anchor='center')
+        self.tree.column('pages', width=180, anchor='center')
+        self.tree.pack(fill='both', expand=True, pady=(0, 10))
+
+        btn_row = ttk.Frame(main)
+        btn_row.pack(fill='x')
+
+        ttk.Button(btn_row, text="Rimuovi Selezionato", command=self.remove_allocation).pack(side='left')
+        ttk.Button(btn_row, text="Conferma e Salva", command=self.save_and_close, style='Accent.TButton').pack(side='right')
+
+        self.lbl_summary = ttk.Label(main, text="", font=('Segoe UI', 9))
+        self.lbl_summary.pack(anchor='w', pady=(6, 0))
+
+        self.refresh_tree()
+
+    def refresh_tree(self):
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        current_page_start = 1
+        total_assigned_firs = 0
+
+        for alloc in self.allocations:
+            firs = alloc['count']
+            pages_count = firs * 4
+            p_start = current_page_start
+            p_end = current_page_start + pages_count - 1
+            current_page_start += pages_count
+            total_assigned_firs += firs
+
+            self.tree.insert('', 'end', values=(alloc['targa'], firs, f"Pag. {p_start} - {p_end} ({pages_count} pag.)"))
+
+        summary_txt = f"Totale formulari configurati: {total_assigned_firs}"
+        if self.total_firs > 0:
+            summary_txt += f" / {self.total_firs} formulari del PDF"
+        self.lbl_summary.config(text=summary_txt)
+
+    def add_allocation(self):
+        targa = self.cbo_targa_dlg.get()
+        try:
+            qty = int(self.ent_qty.get().strip())
+            if qty <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Errore", "Inserire un numero valido di formulari.")
+            return
+
+        self.allocations.append({'targa': targa, 'count': qty})
+        self.refresh_tree()
+
+    def remove_allocation(self):
+        selected = self.tree.selection()
+        if not selected:
+            return
+        idx = self.tree.index(selected[0])
+        del self.allocations[idx]
+        self.refresh_tree()
+
+    def save_and_close(self):
+        self.on_save(self.allocations)
+        self.destroy()
 
 
 class FIRSuiteApp:
@@ -99,6 +218,8 @@ class FIRSuiteApp:
         self.page_index = 0
         self.zoom = 1.15
         self.tk_img = None
+        self.mixed_allocations = []
+
         self._apply_theme()
         self._build_ui()
         self.refresh_anagrafica_list()
@@ -114,7 +235,7 @@ class FIRSuiteApp:
             'border': '#d8d1c7',
             'accent': '#0d6b68',
             'accent_soft': '#d8ebe9',
-            'danger': '#8b3a3a',
+            'danger': '#b82525',
             'canvas': '#c8c0b5',
             'white': '#ffffff',
         }
@@ -233,27 +354,46 @@ class FIRSuiteApp:
 
         top_card = ttk.Frame(wrapper, style='Panel.TFrame', padding=14)
         top_card.pack(fill='x', pady=(0, 10))
+
         self.gen_selected_anagrafica = tk.StringVar()
         self.gen_tipo_iscrizione = tk.StringVar()
         self.gen_selected_targa = tk.StringVar()
+        self.mixed_mode = tk.BooleanVar(value=False)
         self.x_size = tk.DoubleVar(value=4.0)
         self.x_width = tk.DoubleVar(value=1.2)
         self.default_text_font = tk.IntVar(value=10)
         self.debug_mode = tk.BooleanVar(value=True)
-        self.only_odd = tk.BooleanVar(value=True)
+
         ttk.Label(top_card, text='Generazione FIR', style='Section.TLabel').grid(row=0, column=0, columnspan=8, sticky='w', pady=(0, 10))
+        
         ttk.Label(top_card, text='Anagrafica', style='App.TLabel').grid(row=1, column=0, sticky='w')
-        self.cbo_anag = ttk.Combobox(top_card, textvariable=self.gen_selected_anagrafica, width=36, state='readonly')
+        self.cbo_anag = ttk.Combobox(top_card, textvariable=self.gen_selected_anagrafica, width=34, state='readonly')
         self.cbo_anag.grid(row=1, column=1, sticky='w', padx=(6, 14))
         self.cbo_anag.bind('<<ComboboxSelected>>', self.on_generator_select_anagrafica)
+
         ttk.Label(top_card, text='Tipo', style='App.TLabel').grid(row=1, column=2, sticky='w')
-        self.cbo_tipo = ttk.Combobox(top_card, textvariable=self.gen_tipo_iscrizione, values=['2BIS', '4BIS'], width=8, state='readonly')
+        # Tipo iscrizione visibile ma NON modificabile (state='disabled')
+        self.cbo_tipo = ttk.Combobox(top_card, textvariable=self.gen_tipo_iscrizione, values=['2BIS', '4BIS'], width=8, state='disabled')
         self.cbo_tipo.grid(row=1, column=3, sticky='w', padx=(6, 14))
+
         ttk.Label(top_card, text='Targa', style='App.TLabel').grid(row=1, column=4, sticky='w')
-        self.cbo_targa = ttk.Combobox(top_card, textvariable=self.gen_selected_targa, width=12, state='readonly')
+        self.cbo_targa = ttk.Combobox(top_card, textvariable=self.gen_selected_targa, width=16, state='readonly')
         self.cbo_targa.grid(row=1, column=5, sticky='w', padx=(6, 14))
+        self.cbo_targa.bind('<<ComboboxSelected>>', self._on_targa_changed)
+
         ttk.Button(top_card, text='Apri PDF modello', command=self.open_pdf).grid(row=1, column=6, sticky='w')
         ttk.Button(top_card, text='Esporta PDF', command=self.export_pdf, style='Accent.TButton').grid(row=1, column=7, sticky='w', padx=(8, 0))
+
+        # Mini avviso senza targa e Modalità Mista
+        row2_frame = ttk.Frame(top_card, style='Panel.TFrame')
+        row2_frame.grid(row=2, column=0, columnspan=8, sticky='w', pady=(10, 0))
+
+        self.lbl_targa_warning = tk.Label(row2_frame, text='', font=('Segoe UI Semibold', 9), fg=self.colors['danger'], bg=self.colors['panel'])
+        self.lbl_targa_warning.pack(side='left', padx=(0, 20))
+
+        ttk.Checkbutton(row2_frame, text='Modalità Mista (Ripartizione Targhe)', variable=self.mixed_mode, command=self._on_mixed_mode_toggle).pack(side='left')
+        self.btn_config_mixed = ttk.Button(row2_frame, text='Configura Blocchi Targhe', command=self.open_mixed_mode_dialog, state='disabled')
+        self.btn_config_mixed.pack(side='left', padx=(10, 0))
 
         controls_card = ttk.Frame(wrapper, style='Soft.TFrame', padding=12)
         controls_card.pack(fill='x', pady=(0, 10))
@@ -265,7 +405,7 @@ class FIRSuiteApp:
         ttk.Label(controls_card, text='Font base', style='App.TLabel').pack(side='left', padx=(16, 4))
         ttk.Entry(controls_card, textvariable=self.default_text_font, width=6).pack(side='left')
         ttk.Checkbutton(controls_card, text='Debug visivo', variable=self.debug_mode, command=self.refresh_preview).pack(side='left', padx=(18, 0))
-        ttk.Checkbutton(controls_card, text='Solo pagine dispari', variable=self.only_odd, command=self.refresh_preview).pack(side='left', padx=(12, 0))
+        
         ttk.Button(controls_card, text='Aggiorna preview', command=self.refresh_preview).pack(side='right')
         ttk.Button(controls_card, text='Pagina successiva', command=self.next_page).pack(side='right', padx=(0, 8))
         ttk.Button(controls_card, text='Pagina precedente', command=self.prev_page).pack(side='right', padx=(0, 8))
@@ -293,11 +433,13 @@ class FIRSuiteApp:
         widget.grid(row=row, column=1, sticky='w', pady=6)
 
     def refresh_anagrafica_list(self):
+        sort_anagrafiche(self.db)
         self.listbox.delete(0, 'end')
         for rec in self.db['anagrafiche']:
             self.listbox.insert('end', f"{rec.get('denominazione','')} [{rec.get('tipo_iscrizione','')}]")
 
     def refresh_generator_list(self):
+        sort_anagrafiche(self.db)
         labels = [r.get('denominazione', '') for r in self.db['anagrafiche']]
         self.cbo_anag['values'] = labels
         if labels:
@@ -372,7 +514,6 @@ class FIRSuiteApp:
         }
         if self.selected_index is None:
             self.db['anagrafiche'].append(rec)
-            self.selected_index = len(self.db['anagrafiche']) - 1
         else:
             self.db['anagrafiche'][self.selected_index] = rec
         save_db(self.db)
@@ -449,14 +590,63 @@ class FIRSuiteApp:
                 rec = r
                 break
         if not rec:
-            self.cbo_targa['values'] = []
-            self.gen_selected_targa.set('')
+            self.cbo_targa['values'] = [SENZA_TARGA]
+            self.gen_selected_targa.set(SENZA_TARGA)
+            self._update_targa_warning()
             return
+
         self.gen_tipo_iscrizione.set(rec.get('tipo_iscrizione', '2BIS'))
         targhe = rec.get('targhe', [])
-        self.cbo_targa['values'] = targhe
-        self.gen_selected_targa.set(targhe[0] if targhe else '')
+        options = [SENZA_TARGA] + targhe
+        self.cbo_targa['values'] = options
+        self.gen_selected_targa.set(options[1] if len(options) > 1 else SENZA_TARGA)
+
+        self._update_targa_warning()
         self.info.set(f"Selezionata anagrafica: {rec.get('denominazione','')} | Tipo: {self.gen_tipo_iscrizione.get()} | Targa: {self.gen_selected_targa.get()}")
+
+    def _on_targa_changed(self, event=None):
+        self._update_targa_warning()
+
+    def _update_targa_warning(self):
+        if self.gen_selected_targa.get() == SENZA_TARGA or not self.gen_selected_targa.get():
+            self.lbl_targa_warning.config(text="⚠️ ATTENZIONE: Generazione SENZA TARGA!")
+        else:
+            self.lbl_targa_warning.config(text="")
+
+    def _on_mixed_mode_toggle(self):
+        if self.mixed_mode.get():
+            self.btn_config_mixed.config(state='normal')
+            if not self.mixed_allocations:
+                self.open_mixed_mode_dialog()
+        else:
+            self.btn_config_mixed.config(state='disabled')
+
+    def open_mixed_mode_dialog(self):
+        rec = self.get_generator_record()
+        available_targhe = [SENZA_TARGA] + (rec.get('targhe', []) if rec else [])
+        total_pages = len(self.doc) if self.doc else 0
+
+        def save_callback(allocations):
+            self.mixed_allocations = allocations
+            if self.doc:
+                self.refresh_preview()
+
+        MixedModeDialog(self.root, available_targhe, total_pages, self.mixed_allocations, save_callback)
+
+    def get_targa_for_page(self, page_index):
+        if self.mixed_mode.get() and self.mixed_allocations:
+            fir_index = page_index // 4  # 1 formulario = 4 pagine (duplice copia x2)
+            current_count = 0
+            for alloc in self.mixed_allocations:
+                targa = alloc['targa']
+                count = alloc['count']
+                if current_count <= fir_index < current_count + count:
+                    return targa
+                current_count += count
+            if self.mixed_allocations:
+                return self.mixed_allocations[-1]['targa']
+
+        return self.gen_selected_targa.get()
 
     def open_pdf(self):
         path = filedialog.askopenfilename(filetypes=[('PDF files', '*.pdf')])
@@ -477,9 +667,8 @@ class FIRSuiteApp:
             self.render_current_page()
 
     def is_target_page(self, zero_based_index):
-        if not self.only_odd.get():
-            return True
-        return (zero_based_index + 1) % 2 == 1
+        # Il programma lavora solo sulle pagine dispari (1, 3, 5, 7 -> indici 0, 2, 4, 6...)
+        return zero_based_index % 2 == 0
 
     def draw_fit_text(self, c, field, debug=False, name=''):
         x = field['x']
@@ -517,7 +706,10 @@ class FIRSuiteApp:
             c.save()
             packet.seek(0)
             return packet
-        fields = build_fields(record, self.gen_selected_targa.get())
+
+        targa_for_page = self.get_targa_for_page(page_index)
+        fields = build_fields(record, targa_for_page)
+
         if self.is_target_page(page_index):
             for name, field in fields.items():
                 x, y = field['x'], field['y']
@@ -617,12 +809,13 @@ class FIRSuiteApp:
         self.canvas.create_image(18, 18, anchor='nw', image=self.tk_img)
         self.canvas.xview_moveto(0)
         self.canvas.yview_moveto(0)
+
         lato = 'Dispari' if (self.page_index + 1) % 2 == 1 else 'Pari'
+        targa_corrente = self.get_targa_for_page(self.page_index)
         self.info.set(
             f"Pagina {self.page_index + 1}/{len(self.doc)} • {lato} • Debug: {self.debug_mode.get()} • "
-            f"Anagrafica: {self.gen_selected_anagrafica.get()} • Tipo: {self.gen_tipo_iscrizione.get()} • Targa: {self.gen_selected_targa.get()}"
+            f"Anagrafica: {self.gen_selected_anagrafica.get()} • Tipo: {self.gen_tipo_iscrizione.get()} • Targa Pagina: {targa_corrente}"
         )
-
 
     def _on_mousewheel(self, event):
         self.canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
@@ -638,7 +831,9 @@ class FIRSuiteApp:
         if not record:
             messagebox.showwarning("Attenzione", "Seleziona prima un'anagrafica.")
             return
-        suggested = f"FIR_{record.get('denominazione','').replace(' ', '_')}_{self.gen_selected_targa.get() or 'SENZA_TARGA'}.pdf"
+
+        targa_lbl = 'MISTA' if self.mixed_mode.get() else (self.gen_selected_targa.get() or 'SENZA_TARGA')
+        suggested = f"FIR_{record.get('denominazione','').replace(' ', '_')}_{targa_lbl}.pdf"
         output_path = filedialog.asksaveasfilename(
             defaultextension='.pdf',
             filetypes=[('PDF files', '*.pdf')],
